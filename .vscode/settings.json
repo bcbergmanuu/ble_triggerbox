@@ -1,0 +1,19 @@
+{
+    "nrf-connect.taskBindings": {
+        "eraseAndFlash": [
+            {
+                "taskName": "Flash: ble-ad7124/build_sense",
+                "buildConfigs": [
+                    "${workspaceFolder}/build_sense"
+                ]
+            }
+        ]
+    },
+    "files.associations": {
+        "ad7124.h": "c",
+        "ad7124_ble.h": "c",
+        "storage_nvs.h": "c",
+        "nrfx.h": "c",
+        "nrfx_common.h": "c"
+    }
+}
