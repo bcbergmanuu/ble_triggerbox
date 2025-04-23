@@ -1,21 +1,12 @@
-/*!
- *****************************************************************************
-  @file:  ad7124_console_app.c
-
-  @brief: Implementation for the menu functions that handle the AD7124
-
-  @details:
- -----------------------------------------------------------------------------
-Copyright (c) 2019 Analog Devices, Inc.  All rights reserved.
-*/
-
 #include <zephyr/kernel.h>
 #include <zephyr/drivers/gpio.h>                                                                                                                                                     
 
+#include <zephyr/sys/ring_buffer.h>
 #include <zephyr/logging/log.h>
 #include <zephyr/pm/device.h>
 #include <zephyr/settings/settings.h>
 #include <zephyr/drivers/regulator.h>
+
 
 #include <zephyr/bluetooth/bluetooth.h>
 #include <zephyr/bluetooth/hci.h>
@@ -27,22 +18,11 @@ Copyright (c) 2019 Analog Devices, Inc.  All rights reserved.
 #include "hal/nrf_gpio.h"
 
 
-LOG_MODULE_REGISTER(AD7124_BLE, LOG_LEVEL_INF);
+LOG_MODULE_REGISTER(TRIGGERBOX_BLE, LOG_LEVEL_INF);
 
 
 const struct device *const gpio_dev[2] = {DEVICE_DT_GET(DT_NODELABEL(gpio0)),DEVICE_DT_GET(DT_NODELABEL(gpio1))};
-/*
- * @brief  Write generic device register (platform dependent)
- *
- * @param  handle    customizable argument. In this examples is used in
- *                   order to select the correct sensor bus handler.
- * @param  bufr      pointer to data to read in register reg
- * @param  bufw      pointer to data to write in register reg
- * @param  len       number of consecutive bytes to write
- *
- */
 
- //primary custom service 
 static struct bt_uuid_128 uuid_triggerbox_prim = BT_UUID_INIT_128(
 	BT_UUID_128_ENCODE(0xa6c47c93, 0x1112, 0x4ca6, 0x176e, 0xdffb871f11f0));
 
@@ -50,8 +30,8 @@ static struct bt_uuid_128 uuid_data = BT_UUID_INIT_128(
 	BT_UUID_128_ENCODE(0x84b45e35, 0x140a, 0x4d32, 0x92c6, 0x386d8bff160d));
 
 
-
-static uint8_t triggers_ble_buff[1]; //size of packed protobuf
+static bool isConnected = 0;
+static uint8_t triggers_ble_buff[50]; //size of packed protobuf
 
 
 static ssize_t read_ad_buffer(struct bt_conn *conn, const struct bt_gatt_attr *attr,
@@ -64,35 +44,33 @@ static ssize_t read_ad_buffer(struct bt_conn *conn, const struct bt_gatt_attr *a
 }
 
 void ble_notify_adbuffer_proc(struct k_work *ptrWorker);
+void port_triggered_proc(struct k_work *worker);
 
 void enable_gpio_interrupt(struct k_work *work);
 void disable_gpio_interrupt(struct k_work *work);
 
-K_WORK_DEFINE(ble_notify_task, ble_notify_adbuffer_proc);
-K_THREAD_STACK_DEFINE(my_stack_area, 1024);
-K_WORK_DEFINE(enableNotifyTask, enable_gpio_interrupt);
-K_WORK_DEFINE(disableNotifyTask, disable_gpio_interrupt);
+K_WORK_DEFINE(work_ble_notify, ble_notify_adbuffer_proc);
+K_WORK_DEFINE(work_porttrigger, port_triggered_proc);
+
+K_WORK_DEFINE(work_enable_notify, enable_gpio_interrupt);
+K_WORK_DEFINE(work_disable_notify, disable_gpio_interrupt); //todo:implement?
 
 
+K_THREAD_STACK_DEFINE(threatstack_notifyen, 1024);
+K_THREAD_STACK_DEFINE(threatstack_port_triggered, 1024);
+K_THREAD_STACK_DEFINE(threatstack_ble_notify, 1024);
 
+
+RING_BUF_DECLARE(ringbuf, 19);
+
+struct k_work_q work_q_notify_enabler;
+struct k_work_q work_q_port_trigger;
+struct k_work_q work_q_ble_notify;
 
 void rdy_handler(const struct device *dev, struct gpio_callback *cb, uint32_t pins)
-{    
-	NVIC_DisableIRQ(GPIOTE_IRQn);
-    uint32_t port_val0 = nrf_gpio_port_in_read(NRF_P0);
-	uint32_t port_val1 = nrf_gpio_port_in_read(NRF_P1);
-	
-	triggers_ble_buff[0] =\
-		(port_val0 >> 2 & 0b11) |\
-		(port_val0 >> 28 & 0b11) << 2 |\
-		(port_val0 >> 4 & 0b11) << 4 | \
-		(port_val1 >> 11 & 0b11) << 6;
-		
-	LOG_INF("value to send: %d, port0: %d, port1: %d: triggerd by::%d", triggers_ble_buff[0], port_val0, port_val1, pins);
-	NVIC_EnableIRQ(GPIOTE_IRQn);
-
-	k_work_submit(&ble_notify_task);
-	
+{    		
+	//SPARSE("triggerd by: %d", pins);
+	k_work_submit_to_queue(&work_q_port_trigger, &work_porttrigger);		
 }
 
 static const uint8_t gpiopins0[6] = {2,3,4,5,28,29};
@@ -130,13 +108,14 @@ void disable_gpio_interrupt(struct k_work *work)
 {    
 	for(int portnum = 0; portnum < 2; portnum++) {	
 		for(int pin = 0; pin < gpiosizes[portnum]; pin++) {	
+			gpio_pin_configure(gpio_dev[portnum], gpiopinarrs[portnum][pin], GPIO_INPUT);  
 			gpio_pin_interrupt_configure(gpio_dev[portnum], gpiopinarrs[portnum][pin], GPIO_INT_DISABLE);
 		}
 	}
 }
 
 
-struct k_work_q my_work_q;
+
 
 
 
@@ -146,12 +125,12 @@ static void ble_ad_buffer_notify_changed(const struct bt_gatt_attr *attr, uint16
 	ARG_UNUSED(attr);
 	LOG_INF("notify_changed: %d", value);
 	notify_ad_buffer_on = (value == BT_GATT_CCC_NOTIFY) ? 1 : 0;
-	if(value == BT_GATT_CCC_NOTIFY || BT_GATT_CCC_INDICATE)	{
+	if(value == BT_GATT_CCC_NOTIFY || value == BT_GATT_CCC_INDICATE)	{
 		LOG_INF("start listening to triggers");
-		k_work_submit_to_queue(&my_work_q, &enableNotifyTask);						
+		k_work_submit_to_queue(&work_q_notify_enabler, &work_enable_notify);						
 	} else {
 		LOG_INF("stop listening to triggers");
-		k_work_submit_to_queue(&my_work_q, &disableNotifyTask);						
+		k_work_submit_to_queue(&work_q_notify_enabler, &work_disable_notify);						
 	}
 }
 
@@ -175,24 +154,54 @@ BT_GATT_SERVICE_DEFINE(triggerbox_svc,
 	 		       read_ad_buffer, NULL, triggers_ble_buff),
 	BT_GATT_CCC(ble_ad_buffer_notify_changed, BT_GATT_PERM_READ | BT_GATT_PERM_WRITE),
 );
+K_MUTEX_DEFINE(MUT_porttrigger);
+K_MUTEX_DEFINE(MUT_ble_notify);
+
+void port_triggered_proc(struct k_work *worker) {
+	
+	if (k_mutex_lock(&MUT_porttrigger, K_USEC(100)) == 0) {
+
+		uint32_t port_val0 = nrf_gpio_port_in_read(NRF_P0);
+		uint32_t port_val1 = nrf_gpio_port_in_read(NRF_P1);
+		
+		uint8_t portdata =\
+			(port_val0 >> 2 & 0b11) |\
+			(port_val0 >> 28 & 0b11) << 2 |\
+			(port_val0 >> 4 & 0b11) << 4 | \
+			(port_val1 >> 11 & 0b11) << 6;
+				
+		LOG_INF("value to send: %d, port0: %d, port1: %d", portdata, port_val0, port_val1);
+		ring_buf_put(&ringbuf, &portdata, 1);
+		k_mutex_unlock(&MUT_porttrigger);
+	}
+	k_work_submit_to_queue(&work_q_ble_notify, &work_ble_notify);
+}
 
 /// @brief Notify BLE when data ready
 /// @param ptrWorker 
 void ble_notify_adbuffer_proc(struct k_work *ptrWorker) {					
+	
 	if(!isConnected) return;
 	if(!notify_ad_buffer_on) return;
-	
-	struct bt_gatt_attr *notify_attr = bt_gatt_find_by_uuid(triggerbox_svc.attrs, triggerbox_svc.attr_count, &uuid_data.uuid);	
-	struct bt_gatt_notify_params params = {
-        .attr = notify_attr,
-        .data = triggers_ble_buff,
-        .len  = sizeof(triggers_ble_buff),
-      //  .func = notify_complete_cb, 
-    };
+	if (k_mutex_lock(&MUT_ble_notify, K_MSEC(100)) == 0) {		
+		uint8_t enqueued_ringbuffer = ring_buf_get(&ringbuf, triggers_ble_buff, sizeof(triggers_ble_buff));
 
-	int ret = bt_gatt_notify_cb(NULL, &params);
-	if(ret < 0) {
-		LOG_ERR("error notify data %d", ret);
+		struct bt_gatt_attr *notify_attr = bt_gatt_find_by_uuid(triggerbox_svc.attrs, triggerbox_svc.attr_count, &uuid_data.uuid);	
+		struct bt_gatt_notify_params params = {
+			.attr = notify_attr,
+			.data = triggers_ble_buff,
+			.len  = enqueued_ringbuffer,
+		//  .func = notify_complete_cb, 
+		};
+
+		int ret = bt_gatt_notify_cb(NULL, &params);
+		if(ret < 0) {
+			LOG_ERR("error notify data %d", ret);
+		}
+		
+		LOG_INF("notifications send, amount: %d", enqueued_ringbuffer);
+		
+		k_mutex_unlock(&MUT_ble_notify);
 	}
 }
 
@@ -203,7 +212,7 @@ const struct bt_data ad[] = {
 	BT_DATA_BYTES(BT_DATA_UUID16_ALL, BT_UUID_16_ENCODE(BT_UUID_BAS_VAL), BT_UUID_16_ENCODE(BT_UUID_CTS_VAL)),
 };
 
-bool isConnected = 0;
+
 static void connected(struct bt_conn *conn, uint8_t err)
 {
 	if (err) {
@@ -262,11 +271,21 @@ static struct bt_gatt_cb gatt_callbacks = {
 
 int initialize(void)
 {		
-	k_work_queue_init(&my_work_q);
+	k_work_queue_init(&work_q_ble_notify);
+	k_work_queue_init(&work_q_notify_enabler);
+	k_work_queue_init(&work_q_port_trigger);
 
-	k_work_queue_start(&my_work_q, my_stack_area,
-					   K_THREAD_STACK_SIZEOF(my_stack_area), 95,
+	k_work_queue_start(&work_q_notify_enabler, threatstack_notifyen,
+					   K_THREAD_STACK_SIZEOF(threatstack_notifyen), 95,
 					   NULL);	
+
+	k_work_queue_start(&work_q_ble_notify, threatstack_ble_notify,
+						K_THREAD_STACK_SIZEOF(threatstack_ble_notify), 96,
+						NULL);	
+
+	k_work_queue_start(&work_q_port_trigger, threatstack_port_triggered,
+						K_THREAD_STACK_SIZEOF(threatstack_port_triggered), 97,
+						NULL);	
 
 	LOG_INF("loading ble");
 	int err;
