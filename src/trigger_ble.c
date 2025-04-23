@@ -61,7 +61,7 @@ K_THREAD_STACK_DEFINE(threatstack_port_triggered, 1024);
 K_THREAD_STACK_DEFINE(threatstack_ble_notify, 1024);
 
 
-RING_BUF_DECLARE(ringbuf, 19);
+RING_BUF_DECLARE(ringbuf, 75);
 
 struct k_work_q work_q_notify_enabler;
 struct k_work_q work_q_port_trigger;
@@ -115,10 +115,6 @@ void disable_gpio_interrupt(struct k_work *work)
 }
 
 
-
-
-
-
 static uint8_t notify_ad_buffer_on = 0;
 
 static void ble_ad_buffer_notify_changed(const struct bt_gatt_attr *attr, uint16_t value) {
@@ -137,17 +133,9 @@ static void ble_ad_buffer_notify_changed(const struct bt_gatt_attr *attr, uint16
 
 void ble_notify_adbuffer_proc(struct k_work *ptrWorker);
 
-
-
-/* AD7124 readout primary Service Declaration */
 BT_GATT_SERVICE_DEFINE(triggerbox_svc,
 	BT_GATT_PRIMARY_SERVICE(&uuid_triggerbox_prim),
 	
-	// BT_GATT_CHARACTERISTIC(&uuid_identifier.uuid,
-	// 		       BT_GATT_CHRC_READ | BT_GATT_CHRC_WRITE,
-	// 		       BT_GATT_PERM_READ | BT_GATT_PERM_WRITE,
-	// 		       read_identifier, write_identifier, uniqueIdentifier_value),	
-
 	BT_GATT_CHARACTERISTIC(&uuid_data.uuid, 
 	 		       BT_GATT_CHRC_READ | BT_GATT_CHRC_NOTIFY,
 	 		       BT_GATT_PERM_READ,
@@ -159,7 +147,7 @@ K_MUTEX_DEFINE(MUT_ble_notify);
 
 void port_triggered_proc(struct k_work *worker) {
 	
-	if (k_mutex_lock(&MUT_porttrigger, K_USEC(100)) == 0) {
+	if (k_mutex_lock(&MUT_porttrigger, K_NO_WAIT) == 0) {
 
 		uint32_t port_val0 = nrf_gpio_port_in_read(NRF_P0);
 		uint32_t port_val1 = nrf_gpio_port_in_read(NRF_P1);
@@ -173,6 +161,7 @@ void port_triggered_proc(struct k_work *worker) {
 		LOG_INF("value to send: %d, port0: %d, port1: %d", portdata, port_val0, port_val1);
 		ring_buf_put(&ringbuf, &portdata, 1);
 		k_mutex_unlock(&MUT_porttrigger);
+		k_sleep(K_USEC(10));
 	}
 	k_work_submit_to_queue(&work_q_ble_notify, &work_ble_notify);
 }
@@ -183,7 +172,7 @@ void ble_notify_adbuffer_proc(struct k_work *ptrWorker) {
 	
 	if(!isConnected) return;
 	if(!notify_ad_buffer_on) return;
-	if (k_mutex_lock(&MUT_ble_notify, K_MSEC(100)) == 0) {		
+	if (k_mutex_lock(&MUT_ble_notify, K_NO_WAIT) == 0) {		
 		uint8_t enqueued_ringbuffer = ring_buf_get(&ringbuf, triggers_ble_buff, sizeof(triggers_ble_buff));
 
 		struct bt_gatt_attr *notify_attr = bt_gatt_find_by_uuid(triggerbox_svc.attrs, triggerbox_svc.attr_count, &uuid_data.uuid);	
@@ -191,7 +180,7 @@ void ble_notify_adbuffer_proc(struct k_work *ptrWorker) {
 			.attr = notify_attr,
 			.data = triggers_ble_buff,
 			.len  = enqueued_ringbuffer,
-		//  .func = notify_complete_cb, 
+		    //.func = notify_complete_cb, 
 		};
 
 		int ret = bt_gatt_notify_cb(NULL, &params);
@@ -200,6 +189,7 @@ void ble_notify_adbuffer_proc(struct k_work *ptrWorker) {
 		}
 		
 		LOG_INF("notifications send, amount: %d", enqueued_ringbuffer);
+		k_sleep(K_MSEC(50));
 		
 		k_mutex_unlock(&MUT_ble_notify);
 	}
