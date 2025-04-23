@@ -30,7 +30,7 @@ Copyright (c) 2019 Analog Devices, Inc.  All rights reserved.
 LOG_MODULE_REGISTER(AD7124_BLE, LOG_LEVEL_INF);
 
 
-const struct device *const gpio0_dev = DEVICE_DT_GET(DT_NODELABEL(gpio0));
+const struct device *const gpio_dev[2] = {DEVICE_DT_GET(DT_NODELABEL(gpio0)),DEVICE_DT_GET(DT_NODELABEL(gpio1))};
 /*
  * @brief  Write generic device register (platform dependent)
  *
@@ -50,8 +50,8 @@ static struct bt_uuid_128 uuid_data = BT_UUID_INIT_128(
 	BT_UUID_128_ENCODE(0x84b45e35, 0x140a, 0x4d32, 0x92c6, 0x386d8bff160d));
 
 
-#define ble_buff_size (5*sizeof(uint32_t))
-static uint8_t triggers_ble_buff[ble_buff_size]; //size of packed protobuf
+
+static uint8_t triggers_ble_buff[1]; //size of packed protobuf
 
 
 static ssize_t read_ad_buffer(struct bt_conn *conn, const struct bt_gatt_attr *attr,
@@ -64,40 +64,75 @@ static ssize_t read_ad_buffer(struct bt_conn *conn, const struct bt_gatt_attr *a
 }
 
 void ble_notify_adbuffer_proc(struct k_work *ptrWorker);
-void configure_gpio_interrupt(struct k_work *work);
+
+void enable_gpio_interrupt(struct k_work *work);
+void disable_gpio_interrupt(struct k_work *work);
 
 K_WORK_DEFINE(ble_notify_task, ble_notify_adbuffer_proc);
 K_THREAD_STACK_DEFINE(my_stack_area, 1024);
-K_WORK_DEFINE(enableNotifyTask, configure_gpio_interrupt);
+K_WORK_DEFINE(enableNotifyTask, enable_gpio_interrupt);
+K_WORK_DEFINE(disableNotifyTask, disable_gpio_interrupt);
 
-static const struct device *gpio_dev;
-static struct gpio_callback rdy_cb_data;
+
+
 
 void rdy_handler(const struct device *dev, struct gpio_callback *cb, uint32_t pins)
-{
-    // Only trigger this when SPI is idle!
-    uint32_t port_val = nrf_gpio_port_in_read(NRF_P0);
-	//triggers_ble_buff = port_val :: think something smart:
+{    
+	NVIC_DisableIRQ(GPIOTE_IRQn);
+    uint32_t port_val0 = nrf_gpio_port_in_read(NRF_P0);
+	uint32_t port_val1 = nrf_gpio_port_in_read(NRF_P1);
+	
+	triggers_ble_buff[0] =\
+		(port_val0 >> 2 & 0b11) |\
+		(port_val0 >> 28 & 0b11) << 2 |\
+		(port_val0 >> 4 & 0b11) << 4 | \
+		(port_val1 >> 11 & 0b11) << 6;
+		
+	LOG_INF("value to send: %d, port0: %d, port1: %d: triggerd by::%d", triggers_ble_buff[0], port_val0, port_val1, pins);
+	NVIC_EnableIRQ(GPIOTE_IRQn);
 
 	k_work_submit(&ble_notify_task);
-    // Schedule SPI read from ADC here
-}
-
-void configure_gpio_interrupt(struct k_work *work)
-{
-    gpio_pin_configure(gpio0_dev, 2,GPIO_INPUT | GPIO_PULL_UP);
-    gpio_pin_interrupt_configure(gpio_dev, 2, GPIO_INT_EDGE_TO_ACTIVE);
-
-    gpio_init_callback(&rdy_cb_data, rdy_handler, BIT(2));
-    gpio_add_callback(gpio_dev, &rdy_cb_data);
-	//NVIC_EnableIRQ(GPIOTE_IRQn);
-}
-
-void disable_gpio_interrupt()
-{    
-	//NVIC_DisableIRQ(GPIOTE_IRQn);
 	
-    gpio_pin_interrupt_configure(gpio0_dev, 2, GPIO_INT_DISABLE);    
+}
+
+static const uint8_t gpiopins0[6] = {2,3,4,5,28,29};
+static const uint8_t gpiopins1[2] = {11,12};
+
+static const uint8_t *gpiopinarrs[2] = {gpiopins0, gpiopins1};
+static const uint8_t gpiosizes[2] = {6,2};
+
+void configure_gpio()
+{	
+	static struct gpio_callback rdy_cb_data_port0[ARRAY_SIZE(gpiopins0)];
+	static struct gpio_callback rdy_cb_data_port1[ARRAY_SIZE(gpiopins1)];
+
+	static struct gpio_callback *rdy_cb_data_ports[2] = {rdy_cb_data_port0, rdy_cb_data_port1};
+
+	for(int portnum = 0; portnum < 2; portnum++) {	
+		for(int pin = 0; pin < gpiosizes[portnum]; pin++) {
+			gpio_pin_configure(gpio_dev[portnum], gpiopinarrs[portnum][pin], GPIO_INPUT | GPIO_PULL_UP);    
+			gpio_init_callback(&rdy_cb_data_ports[portnum][pin], rdy_handler, BIT(gpiopinarrs[portnum][pin]));    	
+			gpio_add_callback(gpio_dev[portnum], &rdy_cb_data_ports[portnum][pin]);	
+		}
+	}
+	
+}
+
+void enable_gpio_interrupt(struct k_work *work) {
+	for(int portnum = 0; portnum < 2; portnum++) {	
+		for(int pin = 0; pin < gpiosizes[portnum]; pin++) {	
+			gpio_pin_interrupt_configure(gpio_dev[portnum], gpiopinarrs[portnum][pin], GPIO_INT_EDGE_BOTH);
+		}
+	}
+}
+
+void disable_gpio_interrupt(struct k_work *work)
+{    
+	for(int portnum = 0; portnum < 2; portnum++) {	
+		for(int pin = 0; pin < gpiosizes[portnum]; pin++) {	
+			gpio_pin_interrupt_configure(gpio_dev[portnum], gpiopinarrs[portnum][pin], GPIO_INT_DISABLE);
+		}
+	}
 }
 
 
@@ -111,11 +146,12 @@ static void ble_ad_buffer_notify_changed(const struct bt_gatt_attr *attr, uint16
 	ARG_UNUSED(attr);
 	LOG_INF("notify_changed: %d", value);
 	notify_ad_buffer_on = (value == BT_GATT_CCC_NOTIFY) ? 1 : 0;
-	if(value == BT_GATT_CCC_NOTIFY)	{
+	if(value == BT_GATT_CCC_NOTIFY || BT_GATT_CCC_INDICATE)	{
 		LOG_INF("start listening to triggers");
-		k_work_submit_to_queue(&my_work_q, &enableNotifyTask);		
-		
-		
+		k_work_submit_to_queue(&my_work_q, &enableNotifyTask);						
+	} else {
+		LOG_INF("stop listening to triggers");
+		k_work_submit_to_queue(&my_work_q, &disableNotifyTask);						
 	}
 }
 
@@ -143,6 +179,7 @@ BT_GATT_SERVICE_DEFINE(triggerbox_svc,
 /// @brief Notify BLE when data ready
 /// @param ptrWorker 
 void ble_notify_adbuffer_proc(struct k_work *ptrWorker) {					
+	if(!isConnected) return;
 	if(!notify_ad_buffer_on) return;
 	
 	struct bt_gatt_attr *notify_attr = bt_gatt_find_by_uuid(triggerbox_svc.attrs, triggerbox_svc.attr_count, &uuid_data.uuid);	
@@ -166,12 +203,13 @@ const struct bt_data ad[] = {
 	BT_DATA_BYTES(BT_DATA_UUID16_ALL, BT_UUID_16_ENCODE(BT_UUID_BAS_VAL), BT_UUID_16_ENCODE(BT_UUID_CTS_VAL)),
 };
 
-
+bool isConnected = 0;
 static void connected(struct bt_conn *conn, uint8_t err)
 {
 	if (err) {
 		LOG_INF("Connection failed (err 0x%02x)\n", err);
 	} else {		
+		isConnected = true;
 		LOG_INF("Connected\n");		
 	}
 }
@@ -179,6 +217,7 @@ static void connected(struct bt_conn *conn, uint8_t err)
 static void disconnected(struct bt_conn *conn, uint8_t reason)
 {
 	LOG_INF("Disconnected (reason 0x%02x)\n", reason);	
+	isConnected = false;
 }
 
 BT_CONN_CB_DEFINE(conn_callbacks) = {
@@ -221,7 +260,7 @@ static struct bt_gatt_cb gatt_callbacks = {
 	
 };
 
-int ble_load(void)
+int initialize(void)
 {		
 	k_work_queue_init(&my_work_q);
 
@@ -245,8 +284,9 @@ int ble_load(void)
 
 	//clean up bonds
 	//bt_unpair(BT_ID_DEFAULT, BT_ADDR_LE_ANY);	
+	configure_gpio();
 	
 	return 0;
 }
 
-SYS_INIT(ble_load, APPLICATION, CONFIG_APPLICATION_INIT_PRIORITY);
+SYS_INIT(initialize, APPLICATION, CONFIG_APPLICATION_INIT_PRIORITY);
