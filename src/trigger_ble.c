@@ -160,8 +160,8 @@ void port_triggered_proc(struct k_work *worker) {
 				
 		LOG_INF("value to send: %d, port0: %d, port1: %d", portdata, port_val0, port_val1);
 		ring_buf_put(&ringbuf, &portdata, 1);
-		k_mutex_unlock(&MUT_porttrigger);
-		k_sleep(K_USEC(10));
+		k_sleep(K_USEC(30));
+		k_mutex_unlock(&MUT_porttrigger);		
 	}
 	k_work_submit_to_queue(&work_q_ble_notify, &work_ble_notify);
 }
