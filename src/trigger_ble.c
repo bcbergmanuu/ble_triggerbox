@@ -57,11 +57,11 @@ K_WORK_DEFINE(work_disable_notify, disable_gpio_interrupt); //todo:implement?
 
 
 K_THREAD_STACK_DEFINE(threatstack_notifyen, 1024);
-K_THREAD_STACK_DEFINE(threatstack_port_triggered, 1024);
-K_THREAD_STACK_DEFINE(threatstack_ble_notify, 1024);
+K_THREAD_STACK_DEFINE(threatstack_port_triggered, 4096);
+K_THREAD_STACK_DEFINE(threatstack_ble_notify, 4096);
 
 
-RING_BUF_DECLARE(ringbuf, 75);
+RING_BUF_DECLARE(ringbuf, 256);
 
 struct k_work_q work_q_notify_enabler;
 struct k_work_q work_q_port_trigger;
@@ -81,24 +81,35 @@ static const uint8_t gpiosizes[2] = {6,2};
 
 void configure_gpio()
 {	
-	static struct gpio_callback rdy_cb_data_port0[ARRAY_SIZE(gpiopins0)];
-	static struct gpio_callback rdy_cb_data_port1[ARRAY_SIZE(gpiopins1)];
+	//static struct gpio_callback rdy_cb_data_port0[ARRAY_SIZE(gpiopins0)];
+	//static struct gpio_callback rdy_cb_data_port1[ARRAY_SIZE(gpiopins1)];
 
-	static struct gpio_callback *rdy_cb_data_ports[2] = {rdy_cb_data_port0, rdy_cb_data_port1};
+	//static struct gpio_callback *rdy_cb_data_ports[2] = {rdy_cb_data_port0, rdy_cb_data_port1};
 
-	for(int portnum = 0; portnum < 2; portnum++) {	
-		for(int pin = 0; pin < gpiosizes[portnum]; pin++) {
-			gpio_pin_configure(gpio_dev[portnum], gpiopinarrs[portnum][pin], GPIO_INPUT | GPIO_PULL_UP);    
-			gpio_init_callback(&rdy_cb_data_ports[portnum][pin], rdy_handler, BIT(gpiopinarrs[portnum][pin]));    	
-			gpio_add_callback(gpio_dev[portnum], &rdy_cb_data_ports[portnum][pin]);	
+	// for(int portnum = 0; portnum < 2; portnum++) {	
+	// 	for(int pin = 0; pin < gpiosizes[portnum]; pin++) {
+	// 		gpio_pin_configure(gpio_dev[portnum], gpiopinarrs[portnum][pin], GPIO_INPUT | GPIO_PULL_UP);    
+	// 		gpio_init_callback(&rdy_cb_data_ports[portnum][pin], rdy_handler, BIT(gpiopinarrs[portnum][pin]));    	
+	// 		gpio_add_callback(gpio_dev[portnum], &rdy_cb_data_ports[portnum][pin]);	
+	// 	}
+	// }
+	for(int port = 0; port < 2; port++) {	
+		gpio_port_pins_t gpio_masks[2] = {0};
+		for(int pin = 0; pin < gpiosizes[port]; pin++) {
+			gpio_masks[port] |= BIT(gpiopinarrs[port][pin]);
 		}
+
+		static struct gpio_callback gpio_cb_s[2];
+		gpio_init_callback(&gpio_cb_s[port], rdy_handler, gpio_masks[port]);    
+		gpio_add_callback(gpio_dev[port], &gpio_cb_s[port]);
+
 	}
-	
 }
 
 void enable_gpio_interrupt(struct k_work *work) {
 	for(int portnum = 0; portnum < 2; portnum++) {	
 		for(int pin = 0; pin < gpiosizes[portnum]; pin++) {	
+			gpio_pin_configure(gpio_dev[portnum], gpiopinarrs[portnum][pin], GPIO_INPUT | GPIO_PULL_UP);    
 			gpio_pin_interrupt_configure(gpio_dev[portnum], gpiopinarrs[portnum][pin], GPIO_INT_EDGE_BOTH);
 		}
 	}
@@ -107,11 +118,10 @@ void enable_gpio_interrupt(struct k_work *work) {
 void disable_gpio_interrupt(struct k_work *work)
 {    
 	for(int portnum = 0; portnum < 2; portnum++) {	
-		for(int pin = 0; pin < gpiosizes[portnum]; pin++) {	
-			gpio_pin_configure(gpio_dev[portnum], gpiopinarrs[portnum][pin], GPIO_INPUT);  
+		for(int pin = 0; pin < gpiosizes[portnum]; pin++) {				
 			gpio_pin_interrupt_configure(gpio_dev[portnum], gpiopinarrs[portnum][pin], GPIO_INT_DISABLE);
 		}
-	}
+	}	
 }
 
 
@@ -142,12 +152,13 @@ BT_GATT_SERVICE_DEFINE(triggerbox_svc,
 	 		       read_ad_buffer, NULL, triggers_ble_buff),
 	BT_GATT_CCC(ble_ad_buffer_notify_changed, BT_GATT_PERM_READ | BT_GATT_PERM_WRITE),
 );
+
 K_MUTEX_DEFINE(MUT_porttrigger);
 K_MUTEX_DEFINE(MUT_ble_notify);
 
 void port_triggered_proc(struct k_work *worker) {
 	
-	if (k_mutex_lock(&MUT_porttrigger, K_NO_WAIT) == 0) {
+	if (k_mutex_lock(&MUT_porttrigger, K_MSEC(1)) == 0) {
 
 		uint32_t port_val0 = nrf_gpio_port_in_read(NRF_P0);
 		uint32_t port_val1 = nrf_gpio_port_in_read(NRF_P1);
@@ -157,22 +168,25 @@ void port_triggered_proc(struct k_work *worker) {
 			(port_val0 >> 28 & 0b11) << 2 |\
 			(port_val0 >> 4 & 0b11) << 4 | \
 			(port_val1 >> 11 & 0b11) << 6;
-				
-		LOG_INF("value to send: %d, port0: %d, port1: %d", portdata, port_val0, port_val1);
+						
 		ring_buf_put(&ringbuf, &portdata, 1);
-		k_sleep(K_USEC(30));
 		k_mutex_unlock(&MUT_porttrigger);		
+		LOG_INF("value to send: %d, port0: %d, port1: %d", portdata, port_val0, port_val1);
+		k_work_submit_to_queue(&work_q_ble_notify, &work_ble_notify);
+	} else {
+		LOG_INF("could not aquire mutex");
 	}
-	k_work_submit_to_queue(&work_q_ble_notify, &work_ble_notify);
+	
 }
 
 /// @brief Notify BLE when data ready
 /// @param ptrWorker 
 void ble_notify_adbuffer_proc(struct k_work *ptrWorker) {					
-	
+	LOG_INF("ble_notify");
 	if(!isConnected) return;
 	if(!notify_ad_buffer_on) return;
 	if (k_mutex_lock(&MUT_ble_notify, K_NO_WAIT) == 0) {		
+		LOG_INF("mutex aquired");
 		uint8_t enqueued_ringbuffer = ring_buf_get(&ringbuf, triggers_ble_buff, sizeof(triggers_ble_buff));
 
 		struct bt_gatt_attr *notify_attr = bt_gatt_find_by_uuid(triggerbox_svc.attrs, triggerbox_svc.attr_count, &uuid_data.uuid);	
@@ -189,10 +203,13 @@ void ble_notify_adbuffer_proc(struct k_work *ptrWorker) {
 		}
 		
 		LOG_INF("notifications send, amount: %d", enqueued_ringbuffer);
-		k_sleep(K_MSEC(50));
-		
+		k_sleep(K_MSEC(50));				
 		k_mutex_unlock(&MUT_ble_notify);
-	}
+		if(!ring_buf_is_empty(&ringbuf)){
+			LOG_INF("ringbuf was filled after delay");
+			k_work_submit_to_queue(&work_q_ble_notify, &work_ble_notify);			
+		}		
+	}	
 }
 
 //advertising data packet
